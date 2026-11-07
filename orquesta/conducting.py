@@ -107,24 +107,32 @@ class WorkflowState(object):
         return result
 
     def get_task_sequence(self, task_id, route):
+        from collections import deque
+
         idx = self.tasks[constants.TASK_STATE_ROUTE_FORMAT % (task_id, str(route))]
         seq = [(idx, self.sequence[idx])]
         visited = {idx}
 
-        q = queue.Queue()
-        q.put((task_id, route))
+        # Build once per request; repeated reruns cannot use a persistent cache.
+        children = {}
+        for i, entry in enumerate(self.sequence):
+            for parent_idx in entry["prev"].values():
+                parent = self.sequence[parent_idx]
+                children.setdefault((parent["id"], parent["route"]), []).append(i)
 
-        while not q.empty():
-            task_id, route = q.get()
-
-            for i, t in enumerate(self.sequence):
-                for k, v in t["prev"].items():
-                    p = self.sequence[v]
-                    if p["id"] == task_id and p["route"] == route and i not in visited:
-                        visited.add(i)
-                        seq.append((i, t))
-                        q.put((t["id"], t["route"]))
-
+        pending = deque([(task_id, route)])
+        expanded = set()
+        while pending:
+            current = pending.popleft()
+            if current in expanded:
+                continue
+            expanded.add(current)
+            for i in children.get(current, ()):
+                if i not in visited:
+                    visited.add(i)
+                    entry = self.sequence[i]
+                    seq.append((i, entry))
+                    pending.append((entry["id"], entry["route"]))
         return seq
 
     def get_terminal_tasks(self):
@@ -1220,30 +1228,48 @@ class WorkflowConductor(object):
             next_task.pop("term", None)
 
     def _collapse_task_rerun_requests(self, tasks=None):
-        # Get the subsequent sequence of tasks that already ran for each task in the task requests.
-        # The method get_task_sequence returns the index and the dictionary for the task entry.
-        # Only the index is required for further evaluation below.
-        result = {
-            k: [i[0] for i in self.workflow_state.get_task_sequence(t.task_id, t.route)]
-            for k, t in tasks.items()
-        }
+        from collections import deque
 
-        # If the list of task request is greater than one, then we have to check whether
-        # there are task rerun requests that are subsequent task executions for another
-        # task rerun requests. If they are not collapsed/consolidated, then the rerun
-        # will result in multiple branches of executions.
+        # Share an index only for this collapse call, never across state changes.
+        state = self.workflow_state
+        children = {}
+        for i, entry in enumerate(state.sequence):
+            for parent_idx in entry["prev"].values():
+                parent = state.sequence[parent_idx]
+                children.setdefault((parent["id"], parent["route"]), []).append(i)
+
+        result = {}
+        for key, request in tasks.items():
+            idx = state.tasks[
+                constants.TASK_STATE_ROUTE_FORMAT % (request.task_id, str(request.route))
+            ]
+            indices = [idx]
+            visited = {idx}
+            expanded = set()
+            pending = deque([(request.task_id, request.route)])
+            while pending:
+                current = pending.popleft()
+                if current in expanded:
+                    continue
+                expanded.add(current)
+                for i in children.get(current, ()):
+                    if i not in visited:
+                        visited.add(i)
+                        indices.append(i)
+                        entry = state.sequence[i]
+                        pending.append((entry["id"], entry["route"]))
+            result[key] = indices
+
         if len(tasks) > 1:
-            # Keep a requested task only when no other requested task contains all
-            # of the task-state entries in its execution sequence.
+            sets = {key: set(indices) for key, indices in result.items()}
             result = {
-                k: indices
-                for k, indices in result.items()
+                key: indices
+                for key, indices in result.items()
                 if not any(
-                    other_k != k and set(indices) < set(other_indices)
-                    for other_k, other_indices in result.items()
+                    other_key != key and sets[key] < sets[other_key]
+                    for other_key in result
                 )
             }
-
         return result
 
     def request_workflow_rerun(self, task_requests=None):
