@@ -33,6 +33,9 @@ jobs:
       - name: Compare native methods to pinned PR 283
         run: |
           python research/g19/native_compare.py --output results/g19_native_ci.json
+      - name: Complete Orquesta regression suite
+        run: |
+          python -m pytest -q orquesta/tests
       - name: Save comparison and status
         if: always()
         uses: actions/upload-artifact@v4
